@@ -1,0 +1,41 @@
+# db-probe 配置文件
+
+# 监听地址
+listen_address: ":9100"
+
+# 探测间隔
+probe_interval: 30s
+
+# 探测超时时间
+probe_timeout: 5s
+
+# 数据库配置列表
+# 每个数据库实例可以配置不同的项目和环境
+databases:
+  # 本地 MySQL 测试数据库
+  - name: "mysql-local"
+    type: "mysql"
+    host: "localhost"
+    port: 3306
+    user: "root"
+    password: "123456"
+    project: "test-project"
+    env: "local"
+    # dsn: ""  # 可选，如果提供则优先使用
+    # query: ""  # 可选，自定义探测 SQL，默认使用 SELECT 1
+    labels:
+      role: "master"
+
+  # Oracle 数据库示例（取消注释以使用）
+  # - name: "oracle-prod"
+  #   type: "oracle"
+  #   host: "oracle.example.com"
+  #   port: 1521
+  #   user: "system"
+  #   password: "password"
+  #   service_name: "ORCL"  # Oracle 服务名称，默认为 "ORCL"
+  #   project: "production"
+  #   env: "prod"
+  #   labels:
+  #     role: "primary"
+
