@@ -618,6 +618,7 @@ func (p *Prober) probeOnce(target *DBTarget) {
 			"db_port", target.Config.Port,
 			"db_ip", target.IP,
 			"duration_seconds", duration,
+			"sql", target.query,
 			"error_type", fmt.Sprintf("%T", err),
 			"error", err.Error(),
 		}
@@ -643,6 +644,7 @@ func (p *Prober) probeOnce(target *DBTarget) {
 			"db_port", target.Config.Port,
 			"db_ip", target.IP,
 			"duration_seconds", duration,
+			"sql", target.query,
 		}
 		// 如果是 Oracle，添加 service_name
 		if target.Config.Type == "oracle" {
