@@ -7,8 +7,10 @@ package prober
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/imkerbos/db-probe/internal/metrics"
 	"github.com/imkerbos/db-probe/pkg/logger"
 	"github.com/prometheus/client_golang/prometheus"
+	go_ora "github.com/sijms/go-ora/v2"
 )
 
 // DBTarget 数据库探测目标
@@ -100,20 +103,32 @@ func (p *Prober) newTarget(dbCfg *config.DBConfig) (*DBTarget, error) {
 
 	// 构造 DSN
 	dsn := dbCfg.DSN
+	var serviceName string // Oracle 专用，用于后续日志记录
 	if dsn == "" {
 		if dbCfg.Type == "oracle" {
-			// Oracle DSN 格式（go-ora）: oracle://user:password@host:port/service_name
-			serviceName := dbCfg.ServiceName
+			// 根据 go-ora 文档，应该使用 go_ora.BuildUrl 函数来构建连接字符串
+			// 参考：https://github.com/sijms/go-ora#simple-connection
+			serviceName = dbCfg.ServiceName
 			if serviceName == "" {
 				serviceName = "ORCL" // 默认 service name
 			}
-			dsn = fmt.Sprintf("oracle://%s:%s@%s:%d/%s",
-				dbCfg.User,
-				dbCfg.Password,
-				dbCfg.Host,
-				dbCfg.Port,
-				serviceName,
-			)
+
+			// 计算连接超时时间（秒），使用探测超时时间的 2 倍，确保有足够时间建立连接
+			// 但不超过 10 秒，避免过长
+			connectTimeout := int(p.config.ProbeTimeout.Seconds() * 2)
+			if connectTimeout < 3 {
+				connectTimeout = 3 // 最小 3 秒
+			}
+			if connectTimeout > 10 {
+				connectTimeout = 10 // 最大 10 秒
+			}
+
+			// 使用 go_ora.BuildUrl 构建连接字符串
+			// 格式：go_ora.BuildUrl(server, port, service_name, username, password, urlOptions)
+			urlOptions := map[string]string{
+				"CONNECT TIMEOUT": fmt.Sprintf("%d", connectTimeout),
+			}
+			dsn = go_ora.BuildUrl(dbCfg.Host, dbCfg.Port, serviceName, dbCfg.User, dbCfg.Password, urlOptions)
 		} else {
 			// MySQL/TiDB DSN 格式: user:password@tcp(host:port)/database?timeout=5s
 			dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/?timeout=5s&readTimeout=5s&writeTimeout=5s",
@@ -122,6 +137,12 @@ func (p *Prober) newTarget(dbCfg *config.DBConfig) (*DBTarget, error) {
 				dbCfg.Host,
 				dbCfg.Port,
 			)
+		}
+	} else if dbCfg.Type == "oracle" {
+		// 如果提供了自定义 DSN，仍然需要 serviceName 用于日志
+		serviceName = dbCfg.ServiceName
+		if serviceName == "" {
+			serviceName = "ORCL"
 		}
 	}
 
@@ -164,14 +185,202 @@ func (p *Prober) newTarget(dbCfg *config.DBConfig) (*DBTarget, error) {
 		query:  query,
 	}
 
-	logger.L().Infow("数据库目标初始化成功",
+	// 记录脱敏的 DSN（用于诊断）
+	maskedDSN := dsn
+	if dbCfg.Type == "oracle" {
+		// 脱敏 Oracle DSN（使用 go_ora.BuildUrl 构建的格式）
+		if dbCfg.Password != "" {
+			// 构建脱敏的连接字符串用于日志显示
+			connectTimeout := int(p.config.ProbeTimeout.Seconds() * 2)
+			if connectTimeout < 3 {
+				connectTimeout = 3
+			}
+			if connectTimeout > 10 {
+				connectTimeout = 10
+			}
+			urlOptions := map[string]string{
+				"CONNECT TIMEOUT": fmt.Sprintf("%d", connectTimeout),
+			}
+			maskedDSN = go_ora.BuildUrl(dbCfg.Host, dbCfg.Port, serviceName, dbCfg.User, "***", urlOptions)
+		}
+	} else {
+		// 脱敏 MySQL DSN: user:***@tcp(host:port)/...
+		if dbCfg.Password != "" {
+			maskedDSN = fmt.Sprintf("%s:***@tcp(%s:%d)/?timeout=5s&readTimeout=5s&writeTimeout=5s",
+				dbCfg.User, dbCfg.Host, dbCfg.Port)
+		}
+	}
+
+	logFields := []interface{}{
 		"db_name", dbCfg.Name,
 		"db_type", dbCfg.Type,
 		"db_host", dbCfg.Host,
+		"db_port", dbCfg.Port,
 		"db_ip", ip,
-	)
+		"dsn", maskedDSN,
+	}
+	// 如果是 Oracle，添加 service_name 到日志
+	if dbCfg.Type == "oracle" {
+		logFields = append(logFields, "service_name", serviceName)
+		// 如果 service_name 是默认值，记录警告
+		if serviceName == "ORCL" && dbCfg.ServiceName == "" {
+			logger.L().Warnw("Oracle service_name 使用默认值 ORCL，请确认配置是否正确",
+				"db_name", dbCfg.Name,
+				"config_service_name", dbCfg.ServiceName,
+			)
+		}
+	}
+	logger.L().Infow("数据库目标初始化成功", logFields...)
 
 	return target, nil
+}
+
+// analyzeError 分析错误，返回错误阶段和详细描述
+// 阶段包括：TCP连接、协议握手、认证、SQL执行
+func analyzeError(err error, dbType string) (stage string, details string) {
+	if err == nil {
+		return "", ""
+	}
+
+	errMsg := err.Error()
+	errMsgLower := strings.ToLower(errMsg)
+
+	// 使用 errors.Unwrap 获取底层错误
+	unwrapped := errors.Unwrap(err)
+	var underlyingErrMsg string
+	if unwrapped != nil {
+		underlyingErrMsg = unwrapped.Error()
+	}
+
+	// 分析错误类型和阶段
+	// 网络连接错误（TCP 层）
+	if strings.Contains(errMsgLower, "connection refused") ||
+		strings.Contains(errMsgLower, "no such host") ||
+		strings.Contains(errMsgLower, "network is unreachable") ||
+		strings.Contains(errMsgLower, "timeout") && strings.Contains(errMsgLower, "dial") {
+		stage = "TCP连接"
+		details = fmt.Sprintf("无法建立TCP连接: %s", errMsg)
+		if underlyingErrMsg != "" && underlyingErrMsg != errMsg {
+			details += fmt.Sprintf(" (底层错误: %s)", underlyingErrMsg)
+		}
+		return
+	}
+
+	// EOF 错误（通常是协议握手阶段）
+	if strings.Contains(errMsgLower, "eof") || strings.Contains(errMsgLower, "end of file") {
+		stage = "协议握手"
+		details = fmt.Sprintf("协议握手失败 (EOF): %s", errMsg)
+		if dbType == "oracle" {
+			details += "。可能原因：1) service_name不正确 2) Oracle listener未启动 3) 网络中断 4) 超时时间过短"
+		} else {
+			details += "。可能原因：1) 数据库服务未启动 2) 网络中断 3) 超时时间过短"
+		}
+		if underlyingErrMsg != "" && underlyingErrMsg != errMsg {
+			details += fmt.Sprintf(" (底层错误: %s)", underlyingErrMsg)
+		}
+		return
+	}
+
+	// 认证错误
+	if strings.Contains(errMsgLower, "access denied") ||
+		strings.Contains(errMsgLower, "invalid credentials") ||
+		strings.Contains(errMsgLower, "authentication failed") ||
+		strings.Contains(errMsgLower, "ora-01017") || // Oracle 认证错误
+		strings.Contains(errMsgLower, "ora-1017") ||
+		strings.Contains(errMsgLower, "1045") { // MySQL 认证错误
+		stage = "认证"
+		details = fmt.Sprintf("认证失败: %s", errMsg)
+		if underlyingErrMsg != "" && underlyingErrMsg != errMsg {
+			details += fmt.Sprintf(" (底层错误: %s)", underlyingErrMsg)
+		}
+		return
+	}
+
+	// SQL 执行错误
+	if strings.Contains(errMsgLower, "sql") ||
+		strings.Contains(errMsgLower, "syntax error") ||
+		strings.Contains(errMsgLower, "table") ||
+		strings.Contains(errMsgLower, "column") {
+		stage = "SQL执行"
+		details = fmt.Sprintf("SQL执行失败: %s", errMsg)
+		if underlyingErrMsg != "" && underlyingErrMsg != errMsg {
+			details += fmt.Sprintf(" (底层错误: %s)", underlyingErrMsg)
+		}
+		return
+	}
+
+	// Oracle 特定错误
+	if dbType == "oracle" {
+		// ORA-01013: user requested cancel of current operation
+		// 这通常是因为超时导致的操作被取消
+		if strings.Contains(errMsgLower, "ora-01013") || strings.Contains(errMsgLower, "ora-1013") ||
+			strings.Contains(errMsgLower, "user requested cancel") {
+			stage = "超时"
+			details = fmt.Sprintf("操作超时被取消 (ORA-01013): %s", errMsg)
+			details += "。可能原因：1) 超时时间过短 2) 网络延迟较高 3) 数据库响应慢。建议增加 probe_timeout 配置"
+			if underlyingErrMsg != "" && underlyingErrMsg != errMsg {
+				details += fmt.Sprintf(" (底层错误: %s)", underlyingErrMsg)
+			}
+			return
+		}
+
+		// ORA- 错误码（其他 Oracle 错误）
+		if strings.Contains(errMsgLower, "ora-") {
+			stage = "Oracle协议"
+			details = fmt.Sprintf("Oracle协议错误: %s", errMsg)
+			// 提取 ORA 错误码
+			if idx := strings.Index(errMsgLower, "ora-"); idx != -1 {
+				if endIdx := strings.Index(errMsgLower[idx:], " "); endIdx != -1 {
+					oraCode := errMsgLower[idx : idx+endIdx]
+					details += fmt.Sprintf(" (错误码: %s)", oraCode)
+				} else {
+					// 如果没有空格，尝试提取到行尾或特定字符
+					if endIdx := strings.Index(errMsgLower[idx:], ":"); endIdx != -1 {
+						oraCode := errMsgLower[idx : idx+endIdx]
+						details += fmt.Sprintf(" (错误码: %s)", oraCode)
+					}
+				}
+			}
+			if underlyingErrMsg != "" && underlyingErrMsg != errMsg {
+				details += fmt.Sprintf(" (底层错误: %s)", underlyingErrMsg)
+			}
+			return
+		}
+	}
+
+	// MySQL 特定错误
+	if dbType == "mysql" || dbType == "tidb" {
+		// MySQL 错误码
+		if strings.Contains(errMsgLower, "error") && (strings.Contains(errMsgLower, "1045") ||
+			strings.Contains(errMsgLower, "2003") ||
+			strings.Contains(errMsgLower, "2006")) {
+			stage = "MySQL协议"
+			details = fmt.Sprintf("MySQL协议错误: %s", errMsg)
+			if underlyingErrMsg != "" && underlyingErrMsg != errMsg {
+				details += fmt.Sprintf(" (底层错误: %s)", underlyingErrMsg)
+			}
+			return
+		}
+	}
+
+	// 超时错误
+	if strings.Contains(errMsgLower, "context deadline exceeded") ||
+		strings.Contains(errMsgLower, "timeout") {
+		stage = "超时"
+		details = fmt.Sprintf("操作超时: %s", errMsg)
+		if underlyingErrMsg != "" && underlyingErrMsg != errMsg {
+			details += fmt.Sprintf(" (底层错误: %s)", underlyingErrMsg)
+		}
+		return
+	}
+
+	// 默认：未知错误
+	stage = "未知阶段"
+	details = fmt.Sprintf("未知错误: %s", errMsg)
+	if underlyingErrMsg != "" && underlyingErrMsg != errMsg {
+		details += fmt.Sprintf(" (底层错误: %s)", underlyingErrMsg)
+	}
+	return
 }
 
 // Start 启动所有探测任务
@@ -253,13 +462,52 @@ func (p *Prober) probeOnce(target *DBTarget) {
 			// 这里先记录 Ping 失败，重连时间会在下次成功 Ping 时计算
 		}
 
+		// 保存原始错误类型和消息
+		originalErr := err
+		originalErrType := fmt.Sprintf("%T", originalErr)
+		originalErrMsg := originalErr.Error()
+
+		// 分析错误，确定失败阶段和详细描述
+		// Ping 包含多个阶段：1) TCP连接 2) 协议握手 3) 认证 4) 连接到service_name
+		failureStage, errorDetails := analyzeError(originalErr, target.Config.Type)
+
+		// 增强错误信息，明确标注失败阶段
+		errMsg := fmt.Sprintf("[%s阶段失败] %s (host=%s, port=%d, ip=%s, timeout=%v",
+			failureStage, errorDetails, target.Config.Host, target.Config.Port, target.IP, p.config.ProbeTimeout)
+		if target.Config.Type == "oracle" {
+			serviceName := target.Config.ServiceName
+			if serviceName == "" {
+				serviceName = "ORCL"
+			}
+			errMsg += fmt.Sprintf(", service_name=%s", serviceName)
+		}
+		errMsg += ")"
+		// 使用 %s 而不是直接使用变量作为格式字符串，避免 linter 警告
+		err = fmt.Errorf("%s", errMsg)
+
 		up = false
-		logger.L().Debugw("数据库 Ping 失败，连接可能已断开",
+		logFields := []interface{}{
 			"db_name", target.Config.Name,
 			"db_type", target.Config.Type,
 			"db_host", target.Config.Host,
+			"db_port", target.Config.Port,
+			"db_ip", target.IP,
+			"failure_stage", failureStage, // 失败阶段
+			"ping_duration_seconds", pingDuration,
+			"timeout", p.config.ProbeTimeout,
+			"error_type", originalErrType,
 			"error", err.Error(),
-		)
+			"error_details", errorDetails, // 详细错误描述
+			"original_error", originalErrMsg,
+		}
+		if target.Config.Type == "oracle" {
+			serviceName := target.Config.ServiceName
+			if serviceName == "" {
+				serviceName = "ORCL"
+			}
+			logFields = append(logFields, "service_name", serviceName)
+		}
+		logger.L().Debugw("数据库 Ping 失败", logFields...)
 	} else {
 		// Ping 成功
 		pingDuration := time.Since(pingStart).Seconds()
@@ -291,10 +539,42 @@ func (p *Prober) probeOnce(target *DBTarget) {
 		queryDuration := time.Since(queryStart).Seconds()
 
 		if err != nil {
+			// 保存原始错误类型和消息
+			originalErr := err
+			originalErrType := fmt.Sprintf("%T", originalErr)
+			originalErrMsg := originalErr.Error()
+
+			// 分析错误，确定失败阶段和详细描述
+			// SQL 查询阶段可能失败的原因：SQL语法错误、权限不足、表不存在等
+			failureStage, errorDetails := analyzeError(originalErr, target.Config.Type)
+			if failureStage == "未知阶段" || failureStage == "" {
+				failureStage = "SQL执行"
+			}
+
+			// 增强错误信息，明确标注失败阶段
+			err = fmt.Errorf("[%s阶段失败] %s (query=%s, host=%s, port=%d, ip=%s, timeout=%v)",
+				failureStage, errorDetails, target.query, target.Config.Host, target.Config.Port, target.IP, p.config.ProbeTimeout)
+
 			querySuccess = false
 			up = false
 			metrics.RecordQueryFailure(target.Labels) // 记录 SQL 查询失败次数
 			metrics.RecordFailure(target.Labels)      // 记录总体失败次数
+
+			logger.L().Debugw("数据库 SQL 查询失败",
+				"db_name", target.Config.Name,
+				"db_type", target.Config.Type,
+				"db_host", target.Config.Host,
+				"db_port", target.Config.Port,
+				"db_ip", target.IP,
+				"query", target.query,
+				"failure_stage", failureStage, // 失败阶段
+				"query_duration_seconds", queryDuration,
+				"timeout", p.config.ProbeTimeout,
+				"error_type", originalErrType,
+				"error", err.Error(),
+				"error_details", errorDetails, // 详细错误描述
+				"original_error", originalErrMsg,
+			)
 		} else {
 			querySuccess = true
 			up = true
@@ -326,26 +606,55 @@ func (p *Prober) probeOnce(target *DBTarget) {
 	// 更新总体指标
 	metrics.UpdateProbeResult(target.Labels, up, duration)
 
-	// 只在状态变化时记录日志，避免重复刷屏
-	if statusChanged {
-		if err != nil {
-			logger.L().Warnw("数据库探测失败",
-				"db_name", target.Config.Name,
-				"db_type", target.Config.Type,
-				"db_host", target.Config.Host,
-				"db_ip", target.IP,
-				"duration_seconds", duration,
-				"error", err.Error(),
-			)
-		} else {
-			logger.L().Infow("数据库探测成功",
-				"db_name", target.Config.Name,
-				"db_type", target.Config.Type,
-				"db_host", target.Config.Host,
-				"db_ip", target.IP,
-				"duration_seconds", duration,
-			)
+	// 每次探测都记录日志，便于实时了解探测状态
+	if err != nil {
+		// 分析错误阶段（如果还没有分析过）
+		failureStage, errorDetails := analyzeError(err, target.Config.Type)
+
+		logFields := []interface{}{
+			"db_name", target.Config.Name,
+			"db_type", target.Config.Type,
+			"db_host", target.Config.Host,
+			"db_port", target.Config.Port,
+			"db_ip", target.IP,
+			"duration_seconds", duration,
+			"error_type", fmt.Sprintf("%T", err),
+			"error", err.Error(),
 		}
+
+		if failureStage != "" {
+			logFields = append(logFields, "failure_stage", failureStage)
+		}
+		if errorDetails != "" {
+			logFields = append(logFields, "error_details", errorDetails)
+		}
+
+		// 如果是状态变化，使用 Warn 级别；否则使用 Info 级别（避免重复刷屏）
+		if statusChanged {
+			logger.L().Warnw("数据库探测失败", logFields...)
+		} else {
+			logger.L().Infow("数据库探测失败", logFields...)
+		}
+	} else {
+		logFields := []interface{}{
+			"db_name", target.Config.Name,
+			"db_type", target.Config.Type,
+			"db_host", target.Config.Host,
+			"db_port", target.Config.Port,
+			"db_ip", target.IP,
+			"duration_seconds", duration,
+		}
+		// 如果是 Oracle，添加 service_name
+		if target.Config.Type == "oracle" {
+			serviceName := target.Config.ServiceName
+			if serviceName == "" {
+				serviceName = "ORCL"
+			}
+			logFields = append(logFields, "service_name", serviceName)
+		}
+
+		// 成功时使用 Info 级别，每次探测都记录
+		logger.L().Infow("数据库探测成功", logFields...)
 	}
 }
 
