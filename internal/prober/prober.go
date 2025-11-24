@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -201,7 +202,13 @@ func (p *Prober) newTarget(dbCfg *config.DBConfig) (*DBTarget, error) {
 			urlOptions := map[string]string{
 				"CONNECT TIMEOUT": fmt.Sprintf("%d", connectTimeout),
 			}
+			// 使用 go_ora.BuildUrl 构建，但会将密码编码（如 *** 会被编码为 %2A%2A%2A）
+			// 需要将 URL 编码的密码部分替换为易读的 ***
 			maskedDSN = go_ora.BuildUrl(dbCfg.Host, dbCfg.Port, serviceName, dbCfg.User, "***", urlOptions)
+			// 使用正则表达式匹配密码部分（在 @ 符号之前，用户名之后）并替换为 ***
+			// 匹配格式：oracle://user:encoded_password@host:port/service
+			re := regexp.MustCompile(`://([^:]+):[^@]+@`)
+			maskedDSN = re.ReplaceAllString(maskedDSN, "://$1:***@")
 		}
 	} else {
 		// 脱敏 MySQL DSN: user:***@tcp(host:port)/...
