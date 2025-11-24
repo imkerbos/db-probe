@@ -13,7 +13,7 @@ import (
 	"syscall"
 
 	_ "github.com/go-sql-driver/mysql" // MySQL/TiDB 驱动
-	_ "github.com/godror/godror"       // Oracle 驱动
+	_ "github.com/sijms/go-ora"        // Oracle 驱动（纯 Go 实现）
 
 	"github.com/imkerbos/db-probe/internal/config"
 	"github.com/imkerbos/db-probe/internal/prober"

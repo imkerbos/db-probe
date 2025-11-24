@@ -30,7 +30,7 @@ func (d *MySQLDriver) DefaultQuery() string {
 type OracleDriver struct{}
 
 func (d *OracleDriver) DriverName() string {
-	return "godror"
+	return "oracle"
 }
 
 func (d *OracleDriver) DefaultQuery() string {

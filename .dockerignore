@@ -1,0 +1,55 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Documentation
+README.md
+docs/
+*.md
+
+# Build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+db-probe
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test files
+*_test.go
+test/
+tests/
+
+# Docker
+Dockerfile
+docker-compose.yaml
+.dockerignore
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Oracle client (no longer needed)
+oracle-client/
+

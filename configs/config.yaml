@@ -3,11 +3,13 @@
 # 监听地址
 listen_address: ":9100"
 
-# 探测间隔
-probe_interval: 30s
+# 探测间隔（实时性要求：2秒，一般生产环境：5秒）
+probe_interval: 2s
 
-# 探测超时时间
-probe_timeout: 5s
+# 探测超时时间（推荐：探测间隔的 40%-60%，实时性场景推荐 1秒）
+# 对于 2秒间隔：推荐 800ms-1.2s（推荐 1s）
+# 对于 5秒间隔：推荐 2s
+probe_timeout: 1s
 
 # 数据库配置列表
 # 每个数据库实例可以配置不同的项目和环境
@@ -26,16 +28,25 @@ databases:
     labels:
       role: "master"
 
-  # Oracle 数据库示例（取消注释以使用）
-  # - name: "oracle-prod"
-  #   type: "oracle"
-  #   host: "oracle.example.com"
-  #   port: 1521
-  #   user: "system"
-  #   password: "password"
-  #   service_name: "ORCL"  # Oracle 服务名称，默认为 "ORCL"
-  #   project: "production"
-  #   env: "prod"
-  #   labels:
-  #     role: "primary"
+  # Oracle 数据库配置示例
+  # 请根据 DBA 提供的信息填写以下字段：
+  # - name: 数据库名称（自定义，用于标识）
+  # - host: IP 地址（DBA 提供）
+  # - port: 端口（DBA 提供，通常是 1521）
+  # - user: 账号（DBA 提供）
+  # - password: 密码（DBA 提供）
+  # - service_name: 服务名（DBA 提供，重要！）
+  # - project: 项目名称（用于 Prometheus label）
+  # - env: 环境标识（用于 Prometheus label，如 test/prod）
+  - name: "oracle-test"
+    type: "oracle"
+    host: "192.168.1.100"        # 替换为 DBA 提供的 IP 地址
+    port: 1521                    # 替换为 DBA 提供的端口
+    user: "your_username"         # 替换为 DBA 提供的账号
+    password: "your_password"     # 替换为 DBA 提供的密码
+    service_name: "ORCL"          # 替换为 DBA 提供的服务名（重要！）
+    project: "test-project"       # 项目名称
+    env: "test"                   # 环境标识（test/prod/dev）
+    labels:
+      role: "primary"             # 可选的标签
 

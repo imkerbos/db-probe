@@ -72,6 +72,40 @@ func Load() (*Config, error) {
 
 // Validate 校验配置
 func Validate(cfg *Config) error {
+	// 校验探测间隔和超时时间
+	if cfg.ProbeInterval <= 0 {
+		return fmt.Errorf("probe_interval 必须大于 0")
+	}
+	if cfg.ProbeTimeout <= 0 {
+		return fmt.Errorf("probe_timeout 必须大于 0")
+	}
+	// 超时时间必须小于探测间隔，避免连接被占用影响下一次探测
+	if cfg.ProbeTimeout >= cfg.ProbeInterval {
+		return fmt.Errorf("probe_timeout (%v) 必须小于 probe_interval (%v)，建议超时时间为探测间隔的 40%%-60%%", cfg.ProbeTimeout, cfg.ProbeInterval)
+	}
+	// 对于实时性要求高的场景（2秒间隔），建议超时时间为 800ms-1.2s
+	// 这样可以覆盖正常延迟（20-400ms）和轻微网络延迟（200-500ms）
+	// 同时避免超时时间过长影响下一次探测
+	recommendedTimeout := cfg.ProbeInterval / 2 // 推荐：50%的间隔
+	minTimeout := cfg.ProbeInterval / 3         // 最小：33%的间隔（约 667ms for 2s）
+	maxTimeout := cfg.ProbeInterval * 3 / 5     // 最大：60%的间隔（约 1.2s for 2s）
+
+	if cfg.ProbeTimeout < minTimeout {
+		logger.L().Warnw("probe_timeout 过短，可能导致正常网络延迟也被判定为超时",
+			"probe_timeout", cfg.ProbeTimeout,
+			"probe_interval", cfg.ProbeInterval,
+			"recommended_timeout", recommendedTimeout,
+			"min_timeout", minTimeout,
+		)
+	} else if cfg.ProbeTimeout > maxTimeout {
+		logger.L().Warnw("probe_timeout 过长，可能影响下一次探测的及时性",
+			"probe_timeout", cfg.ProbeTimeout,
+			"probe_interval", cfg.ProbeInterval,
+			"recommended_timeout", recommendedTimeout,
+			"max_timeout", maxTimeout,
+		)
+	}
+
 	if len(cfg.Databases) == 0 {
 		return fmt.Errorf("配置项 databases 不能为空")
 	}

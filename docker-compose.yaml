@@ -1,0 +1,61 @@
+services:
+  db-probe:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 构建参数，可以通过环境变量或 .env 文件设置
+        VERSION: ${VERSION:-dev}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    # Docker Hub 镜像名称，格式：username/repository:tag
+    # 可以通过环境变量 DOCKER_HUB_USER 和 IMAGE_TAG 配置
+    image: ${DOCKER_HUB_USER:-yourusername}/db-probe:${IMAGE_TAG:-latest}
+    container_name: db-probe
+    restart: unless-stopped
+    ports:
+      # 格式：主机端口:容器端口
+      - "${DB_PROBE_PORT:-9100}:9100"
+    volumes:
+      # 挂载配置文件，方便修改配置而不需要重新构建镜像
+      # 使用 :ro 表示只读挂载，提高安全性
+      - ./configs/config.yaml:/app/configs/config.yaml:ro
+    environment:
+      # 时区设置
+      - TZ=Asia/Shanghai
+      # 如果需要通过环境变量覆盖配置，可以在这里添加
+      # - DB_PROBE_LISTEN_ADDRESS=:9100
+    networks:
+      - db-probe-network
+    healthcheck:
+      # 健康检查：访问 /health 端点
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9100/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    labels:
+      - "com.db-probe.description=Database availability probe and Prometheus exporter"
+      - "com.db-probe.version=${VERSION:-dev}"
+      - "com.db-probe.maintainer=db-probe team"
+    # 资源限制（可选，根据实际需求调整）
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  db-probe-network:
+    driver: bridge
+    name: db-probe-network
+

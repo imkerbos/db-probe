@@ -30,6 +30,7 @@ type DBTarget struct {
 	query        string
 	mu           sync.RWMutex
 	lastPingTime time.Time // 上次 Ping 时间，用于检测重连
+	lastUpStatus *bool     // 上次探测状态（nil 表示首次探测），用于检测状态变化
 }
 
 // Prober 探针管理器
@@ -101,12 +102,12 @@ func (p *Prober) newTarget(dbCfg *config.DBConfig) (*DBTarget, error) {
 	dsn := dbCfg.DSN
 	if dsn == "" {
 		if dbCfg.Type == "oracle" {
-			// Oracle DSN 格式: user/password@host:port/service_name
+			// Oracle DSN 格式（go-ora）: oracle://user:password@host:port/service_name
 			serviceName := dbCfg.ServiceName
 			if serviceName == "" {
 				serviceName = "ORCL" // 默认 service name
 			}
-			dsn = fmt.Sprintf("%s/%s@%s:%d/%s",
+			dsn = fmt.Sprintf("oracle://%s:%s@%s:%d/%s",
 				dbCfg.User,
 				dbCfg.Password,
 				dbCfg.Host,
@@ -304,32 +305,47 @@ func (p *Prober) probeOnce(target *DBTarget) {
 
 	duration := time.Since(start).Seconds()
 
-	// 更新 target 状态
+	// 更新 target 状态并检测状态变化
 	target.mu.Lock()
+	lastUpStatus := target.lastUpStatus
+	statusChanged := false
+	if lastUpStatus == nil {
+		// 首次探测，记录状态
+		statusChanged = true
+	} else if *lastUpStatus != up {
+		// 状态发生变化
+		statusChanged = true
+	}
 	target.LastError = err
+	if target.lastUpStatus == nil {
+		target.lastUpStatus = new(bool)
+	}
+	*target.lastUpStatus = up
 	target.mu.Unlock()
 
 	// 更新总体指标
 	metrics.UpdateProbeResult(target.Labels, up, duration)
 
-	// 记录日志
-	if err != nil {
-		logger.L().Warnw("数据库探测失败",
-			"db_name", target.Config.Name,
-			"db_type", target.Config.Type,
-			"db_host", target.Config.Host,
-			"db_ip", target.IP,
-			"duration_seconds", duration,
-			"error", err.Error(),
-		)
-	} else {
-		logger.L().Debugw("数据库探测成功",
-			"db_name", target.Config.Name,
-			"db_type", target.Config.Type,
-			"db_host", target.Config.Host,
-			"db_ip", target.IP,
-			"duration_seconds", duration,
-		)
+	// 只在状态变化时记录日志，避免重复刷屏
+	if statusChanged {
+		if err != nil {
+			logger.L().Warnw("数据库探测失败",
+				"db_name", target.Config.Name,
+				"db_type", target.Config.Type,
+				"db_host", target.Config.Host,
+				"db_ip", target.IP,
+				"duration_seconds", duration,
+				"error", err.Error(),
+			)
+		} else {
+			logger.L().Infow("数据库探测成功",
+				"db_name", target.Config.Name,
+				"db_type", target.Config.Type,
+				"db_host", target.Config.Host,
+				"db_ip", target.IP,
+				"duration_seconds", duration,
+			)
+		}
 	}
 }
 

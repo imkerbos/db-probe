@@ -2,17 +2,17 @@
 
 数据库可用性探针 + Prometheus Exporter
 
+支持监控 **MySQL**、**TiDB** 和 **Oracle** 数据库，通过周期性执行轻量级 SQL 查询来检测数据库可用性和延迟，并通过 Prometheus 指标暴露监控数据。
+
 ## 功能特性
 
-- 支持 MySQL/TiDB 和 Oracle 数据库探测
-- 周期性执行轻量探测 SQL（`SELECT 1` / `SELECT 1 FROM dual`）
-- 采集指标：
-  - **基础指标**：可用性、总耗时、时间戳、目标信息
-  - **Ping 指标**：Ping 状态和耗时（用于检测网络连接）
-  - **SQL 查询指标**：查询状态和耗时（用于检测数据库功能）
-  - **连接重连指标**：重连次数和耗时（用于检测连接稳定性）
-- 通过 HTTP `/metrics` 暴露 Prometheus 指标
-- 支持通过配置文件设置探测间隔、超时时间等参数
+- ✅ **多数据库支持**：MySQL、TiDB、Oracle
+- ✅ **实时探测**：支持 2 秒间隔的实时监控
+- ✅ **完整指标**：13 个 Prometheus 指标，覆盖可用性、延迟、失败统计等
+- ✅ **细粒度监控**：Ping 和 SQL 查询分离，精确定位问题
+- ✅ **连接管理**：自动连接池管理、重连检测
+- ✅ **灵活配置**：支持 IP 地址和 DNS 域名，自定义 DSN 和查询
+- ✅ **独立部署**：Docker 镜像包含所有依赖，开箱即用
 
 ## 项目结构
 
@@ -24,7 +24,7 @@ db-probe/
 │   ├── config/
 │   │   └── config.go        # 配置加载 & 校验
 │   ├── metrics/
-│   │   └── metrics.go       # Prometheus 指标定义
+│   │   └── metrics.go        # Prometheus 指标定义
 │   ├── db/
 │   │   └── driver.go        # DB 类型抽象（mysql/tidb/oracle）
 │   └── prober/
@@ -35,91 +35,130 @@ db-probe/
 ├── configs/
 │   └── config.yaml          # 配置文件
 ├── Makefile                 # 构建脚本
-├── Dockerfile               # Docker 构建文件
+├── Dockerfile               # Docker 构建文件（包含 Oracle 支持）
 └── README.md
 ```
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 使用 Docker（推荐）
 
 ```bash
+# 构建镜像（包含 MySQL、TiDB、Oracle 支持）
+docker build -t db-probe:latest .
+
+# 运行容器
+docker run -d \
+  --name db-probe \
+  -p 9100:9100 \
+  -v $(pwd)/configs/config.yaml:/app/configs/config.yaml \
+  db-probe:latest
+```
+
+### 2. 编译 Linux 二进制文件
+
+```bash
+# 使用 Docker 编译 Linux 版本（包含所有数据库支持）
+make linux-build
+
+# 会生成：bin/db-probe-linux-amd64
+# 可以直接在 Linux 服务器上运行
+```
+
+### 3. 本地开发
+
+```bash
+# 安装依赖
 make deps
-```
 
-### 2. 配置数据库
-
-编辑 `configs/config.yaml`，配置要探测的数据库：
-
-```yaml
-listen_address: ":9100"
-probe_interval: 30s
-probe_timeout: 5s
-
-databases:
-  - name: "mysql-test"
-    type: "mysql"
-    host: "localhost"
-    port: 3306
-    user: "root"
-    password: "password"
-    project: "project-a"  # 项目名称
-    env: "prod"           # 环境标识
-    labels:
-      role: "master"
-```
-
-### 3. 构建和运行
-
-```bash
 # 构建
 make build
 
 # 运行
 make run
-
-# 或直接运行（固定从 configs/config.yaml 读取配置）
-./bin/db-probe
 ```
-
-### 4. 查看指标
-
-访问 `http://localhost:9100/metrics` 查看 Prometheus 指标。
 
 ## 配置说明
 
 ### 主配置项
 
-- `listen_address`: HTTP 服务监听地址（默认: `:9100`）
-- `probe_interval`: 探测间隔（默认: `30s`）
-- `probe_timeout`: 探测超时时间（默认: `5s`）
+编辑 `configs/config.yaml`：
+
+```yaml
+# 监听地址
+listen_address: ":9100"
+
+# 探测间隔（实时性要求：2秒，一般生产环境：5秒）
+probe_interval: 2s
+
+# 探测超时时间（推荐：探测间隔的 40%-60%，实时性场景推荐 1秒）
+probe_timeout: 1s
+```
 
 ### 数据库配置
 
 每个数据库实例可以配置不同的项目和环境：
 
-- `name`: 数据库名称（必须唯一）
-- `type`: 数据库类型（`mysql`、`tidb`、`oracle`）
-- `host`: 数据库主机（支持 IP 地址和 DNS 域名）
-- `port`: 数据库端口
-- `user`: 用户名
-- `password`: 密码
-- `project`: 项目名称（用于 Prometheus label，每个实例独立配置）
-- `env`: 环境标识（用于 Prometheus label，每个实例独立配置）
-- `dsn`: 可选，自定义 DSN（如果提供则优先使用）
-- `query`: 可选，自定义探测 SQL（默认：`SELECT 1` 或 `SELECT 1 FROM dual`）
-- `labels`: 额外的 label 维度（如 `role`）
+#### MySQL/TiDB 配置示例
+
+```yaml
+databases:
+  - name: "mysql-prod"
+    type: "mysql"              # 或 "tidb"
+    host: "192.168.1.100"      # 支持 IP 地址和 DNS 域名
+    port: 3306
+    user: "monitor"
+    password: "password"
+    project: "production"       # 项目名称（用于 Prometheus label）
+    env: "prod"                 # 环境标识（用于 Prometheus label）
+    labels:
+      role: "master"            # 可选的标签
+```
+
+#### Oracle 配置示例
+
+```yaml
+databases:
+  - name: "oracle-prod"
+    type: "oracle"
+    host: "192.168.1.200"
+    port: 1521
+    user: "system"
+    password: "password"
+    service_name: "ORCLDB"      # Oracle 服务名（重要！）
+    project: "production"
+    env: "prod"
+    labels:
+      role: "primary"
+```
+
+### 配置字段说明
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `name` | ✅ | 数据库名称（必须唯一） |
+| `type` | ✅ | 数据库类型：`mysql`、`tidb`、`oracle` |
+| `host` | ✅ | 数据库主机（支持 IP 地址和 DNS 域名） |
+| `port` | ✅ | 数据库端口 |
+| `user` | ✅ | 用户名 |
+| `password` | ✅ | 密码 |
+| `service_name` | ⚠️ | Oracle 专用：服务名称（默认 "ORCL"） |
+| `project` | ✅ | 项目名称（用于 Prometheus label） |
+| `env` | ✅ | 环境标识（用于 Prometheus label） |
+| `dsn` | ❌ | 可选，自定义 DSN（如果提供则优先使用） |
+| `query` | ❌ | 可选，自定义探测 SQL（默认：`SELECT 1` 或 `SELECT 1 FROM dual`） |
+| `labels` | ❌ | 额外的 label 维度（如 `role`） |
 
 ## Prometheus 指标
 
-db-probe 暴露以下 Prometheus 指标，所有指标都包含统一的 label 维度。
+db-probe 暴露 **13 个 Prometheus 指标**，所有指标都包含统一的 label 维度。
 
 ### 基础指标
 
 | 指标名称 | 类型 | 说明 |
 |---------|------|------|
 | `db_probe_up` | Gauge | 数据库可用性状态（1=可用，0=不可用） |
-| `db_probe_duration_seconds` | Gauge | 总探测耗时（秒），包含 Ping + SQL 查询 + 连接建立时间 |
+| `db_probe_duration_seconds` | Gauge | 总探测耗时（秒） |
 | `db_probe_last_timestamp` | Gauge | 最近探测时间戳（Unix 时间戳） |
 | `db_probe_target_info` | Gauge | 目标信息（静态信息，固定为 1） |
 
@@ -163,15 +202,15 @@ db-probe 暴露以下 Prometheus 指标，所有指标都包含统一的 label �
 ### Label 维度
 
 所有指标都包含以下 label：
-- `project`: 项目名称（从数据库配置中获取）
-- `env`: 环境标识（从数据库配置中获取）
+- `project`: 项目名称
+- `env`: 环境标识
 - `db_name`: 数据库名称
 - `db_type`: 数据库类型（`mysql`、`tidb`、`oracle`）
 - `db_host`: 数据库主机（配置的 host）
 - `db_ip`: 解析后的 IP 地址
 - `role`: 角色（从 labels 中提取，可选）
 
-### 指标使用示例
+### PromQL 查询示例
 
 **检测数据库不可用**：
 ```promql
@@ -203,15 +242,25 @@ rate(db_probe_failures_total[5m]) > 0.1
 increase(db_probe_failures_total[1h])
 ```
 
-**查看详细指标说明**：请参考 [指标参考文档](docs/metrics-reference.md)
-
 ## HTTP 端点
 
-- `/metrics`: Prometheus 指标端点
-- `/health`: 健康检查端点
-- `/targets`: 目标列表（JSON 格式，用于调试）
+- **`/metrics`**: Prometheus 指标端点
+- **`/health`**: 健康检查端点（返回 `OK`）
+- **`/targets`**: 目标列表（JSON 格式，用于调试）
 
-## Docker 部署
+## 编译和部署
+
+### 使用 Docker 编译 Linux 二进制
+
+```bash
+# 编译 Linux 版本（包含 MySQL、TiDB、Oracle 支持）
+make linux-build
+
+# 会生成：bin/db-probe-linux-amd64
+# 可以直接在 Linux 服务器上运行
+```
+
+### 使用 Docker 镜像
 
 ```bash
 # 构建镜像
@@ -219,9 +268,23 @@ docker build -t db-probe:latest .
 
 # 运行容器
 docker run -d \
+  --name db-probe \
   -p 9100:9100 \
   -v $(pwd)/configs/config.yaml:/app/configs/config.yaml \
   db-probe:latest
+```
+
+### 本地编译
+
+```bash
+# 安装依赖
+make deps
+
+# 构建
+make build
+
+# 运行
+make run
 ```
 
 ## 环境变量
@@ -230,11 +293,34 @@ docker run -d \
 
 ```bash
 export DB_PROBE_LISTEN_ADDRESS=":9100"
-export DB_PROBE_PROBE_INTERVAL="30s"
-export DB_PROBE_PROBE_TIMEOUT="5s"
+export DB_PROBE_PROBE_INTERVAL="2s"
+export DB_PROBE_PROBE_TIMEOUT="1s"
 ```
 
 **注意**：配置文件固定从 `configs/config.yaml` 读取，不支持命令行参数指定配置文件路径。
+
+## 性能建议
+
+### 探测间隔和超时时间
+
+**实时性要求高的场景**（推荐）：
+- 探测间隔：`2s`
+- 超时时间：`1s`（50% 的间隔）
+
+**一般生产环境**：
+- 探测间隔：`5s`
+- 超时时间：`2s`（40% 的间隔）
+
+**大规模生产环境**：
+- 探测间隔：`10s`
+- 超时时间：`3s`（30% 的间隔）
+
+### 配置验证
+
+程序启动时会自动验证配置：
+- 超时时间必须小于探测间隔
+- 建议超时时间为探测间隔的 40%-60%
+- 如果配置不合理，会输出警告信息
 
 ## 开发
 
@@ -247,9 +333,35 @@ make vet
 
 # 运行测试
 make test
+
+# 清理构建产物
+make clean
 ```
+
+## 常见问题
+
+### Q1: Oracle 连接失败
+
+**解决方案**：
+- 检查服务名（`service_name`）是否正确
+- 检查 IP 和端口是否正确
+- 检查账号密码是否正确
+- 确保网络可达
+
+### Q2: 编译时 Oracle 驱动失败
+
+**解决方案**：
+- Oracle 驱动需要 CGO 和 Oracle Instant Client
+- 使用 Docker 编译（已包含所有依赖）
+- 或使用 `make linux-build` 命令
+
+### Q3: 运行时找不到 Oracle 库
+
+**解决方案**：
+- Docker 镜像已包含 Oracle Instant Client
+- 如果直接使用二进制文件，需要安装 Oracle Instant Client
+- 设置 `LD_LIBRARY_PATH` 环境变量
 
 ## 许可证
 
 MIT
-
